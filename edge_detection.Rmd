@@ -1,0 +1,346 @@
+---
+title: "Edge Detection and Segmentation"
+author: "Scott McKean"
+date: "4/13/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(imager)
+library(tidyverse)
+library(fixedpoints)
+library(raster)
+library(sp)
+library(sf)
+library(parallel)
+library(doParallel)
+library(foreach)
+
+expandStrong <- function(ws) {
+  overlap <- grow(ws$strong,2) & ws$weak
+  ws$strong[overlap] <- TRUE
+  ws$weak[overlap] <- FALSE
+  ws
+}
+
+```
+
+# Fracture identification in R
+
+The identification of fractures in photographs of outcrops and core samples is a common problem faced by geomechanics practicioners. Here, we are going to use edge detection, filtering, and segmentation to convert a photograph of an outcrop into vectorized fractures.
+
+Our first step is to convert the raw image into a grayscale .tiff file. This is done in photoshop since we need to select an appropriate cropped area, but it could by automated using libdraw if the photograph is well oriented and simply needs to be converted to grayscale.
+
+Our algorithm is designed to run on a single fracture set at a time. In our example, there are four dominant fracture sets - the bedding plane, vertical fractures that are perpendicular to bedding, and two oblique sets of fractures. We will run the same algorithm multiple times on a rotated version of the image in order to identify these sets.
+
+## Photoshop Workflow
+
+For the fracture windows, the photoshop workflow includes:
+- Open .DNG file
+- Crop the window (rotate and size)
+- Apply B&W04 profile with automatic white balance
+- Apply the Gray Gamma 2.2 colour sapce with 16 bits / channel
+- Size the image as 1000 pixels x 1000 pixels @ 999 pixels/inch (maximum resolution)
+- Save the image as .tif without compression
+
+## Image Loading & Gradients
+
+Here we load and calculate the gradients of our image, along with applying a light denoising algorithm.
+
+We start by using the imager package to load our image. 
+
+We rotate this so that our desired fracture set is vertical. 
+
+Run a light denoising algorithm to remove random noise and improve gradient calculations (isotropic blur with a very low sigma)
+
+We then calculate the gradient perpendicular to our fracture set.
+
+In order to reduce the amount of edges we detect, we limit the gradient to a positive increase only (the first part of the edge), the sign of this limit will depend on the orientation of light since fractures manifest as shadows.
+
+We then apply a vertical gaussian filter with a stronger sigma to connect vertical fractures (similar to growing the pixel set or doing distance thresholding with connected components).
+
+In this study - we run through two main sets of fractures - horizontal bedding planes and low angle fractures and high angle vertical bed bound fractures. We then add tectonic fractures manually using illustrator during the manual editing process.
+
+```{r}
+# basic setup
+window <- '15'
+set <- 'vert' # horiz or vert
+
+min_pts <- 50
+thres_strong <- .96
+thres_weak <- thres_strong - 0.1
+
+in_path <- './fracture_windows/'
+
+out_path <- paste0('./AC1_',window,'/')
+if (!dir.exists(out_path)) dir.create(out_path)
+ 
+
+files <- list.files(path = in_path, pattern = paste0('AC1_',window))
+img <- load.image(file = paste0(in_path,files[1]))
+
+# load image
+if (set == 'horiz'){
+  anisotropy <- 0.01 # low (0.01) for horiz edges
+} else if (set == 'vert') {
+  anisotropy <- 100 # high for vert edges
+} else {
+  anisotropy <- 1
+}
+
+# run a light denoising algorithm with a low standard deviation
+img_denoise <- isoblur(img, sigma = 0.5)
+
+# calculate gradient in x and y directions
+gr <- imgradient(img_denoise,"xy")
+# take one sided gradient to reduce edge duplication
+gr$x[gr$x > 0] <- 0
+gr$y[gr$y > 0] <- 0
+plot(gr,layout="row")
+
+mag <- with(gr,sqrt(anisotropy*x^2+(1/anisotropy)*y^2))
+plot(mag, main = 'magnitude')
+
+save.image(mag,paste0(out_path,'AC1_',window,'_',set,'_mag.tif'))
+
+# get angles
+# ang <- with(gr,atan2((1/anisotropy)*y,anisotropy*x)) 
+# cs <- scales::gradient_n_pal(c("red","darkblue","lightblue","red"),c(-pi,-pi/2,pi/2,pi))
+# plot(ang,colourscale = cs, rescale=FALSE)
+```
+
+## Thresholding and Non-Maxima Supression
+
+The next step in the Canny edge detection is to threshold the results and run non-maxima supression to pull individual lines ot
+
+```{r threshold}
+# non-maxima supression
+nX <- Xc(img_denoise) + anisotropy*gr$x/mag 
+nY <- Yc(img_denoise) + (1/anisotropy)*gr$y/mag
+val.fwd <- interp(mag,data.frame(x=as.vector(nX),y=as.vector(nY)))
+nX <- Xc(img_denoise) - anisotropy*gr$x/mag 
+nY <- Yc(img_denoise) - (1/anisotropy)*gr$y/mag
+val.bwd <- interp(mag,data.frame(x=as.vector(nX),y=as.vector(nY)))
+throw <- (mag < val.bwd) | (mag < val.fwd)
+mag[throw] <- 0
+
+save.image(as.cimg(threshold(mag)),paste0(out_path,'AC1_',window,'_',set,'_nms.tif'))
+```
+
+## Hysteresis
+
+Now we apply the hysterisis part of the Canny edge detector
+
+```{r}
+t2 <- quantile(mag,thres_strong)
+t1 <- quantile(mag,thres_weak)
+layout(t(1:2))
+
+strong <- mag>t2
+save.image(as.cimg(strong),paste0(out_path,'AC1_',window,'_',set,'_strong.tif'))
+weak <- mag %inr% c(t1,t2)
+save.image(as.cimg(weak),paste0(out_path,'AC1_',window,'_',set,'_weak.tif'))
+
+hystFP <- fp(expandStrong)
+
+out <- list(strong=strong,weak=weak) %>% hystFP
+
+canny <- out$strong
+save.image(as.cimg(canny),paste0(out_path,'AC1_',window,'_',set,'_canny.tif'))
+
+label_df <- label(canny, high_connectivity = TRUE) %>% 
+  as.data.frame() %>%
+  filter(value > 0)
+  
+edge_df <- as.data.frame(canny)
+
+final_df <- label_df %>% 
+  filter(value > 0) %>%
+  left_join(x= ., y = edge_df, by = c("x","y")) %>%
+  dplyr::select(-z,-cc)
+
+large_edges <- final_df %>% group_by(value) %>% tally() %>% filter(n > min_pts) %>% pull(value)
+large_edge_df <- final_df %>% filter(value %in% large_edges)
+
+write.csv(large_edge_df,paste0(out_path,'AC1_',window,'_',set,'_large_edges.csv'))
+
+save.image(as.cimg(large_edge_df),paste0(out_path,'AC1_',window,'_',set,'_large_edges.tif'))
+
+# ggplot(large_edge_df, aes(x=x, y=y, colour = value)) +
+#   geom_raster(data = as.data.frame(img_denoise), aes(x=x, y=y, fill = value)) +
+#   geom_point(size = 0.5) + 
+#   coord_equal() +
+#   scale_y_reverse() +
+#   scale_fill_gradient(low="black",high="white") +
+#   ggsave(paste0('test_edge',rot,'.jpg'))
+
+# test for magnitude row (intesection)
+# mag_row <- data.frame('y' = as.matrix(mag)[100,])
+# mag_row['x'] <- seq(1:nrow(mag_row))
+# 
+# ggplot(mag_row %>% filter(y > 0.1)) +
+#   geom_vline(aes(xintercept = x)) +
+#   theme_minimal()
+
+```
+
+## Hough Transform
+
+Unfortunately least squares doesn't work with vertical lines - so we turn to the Hough Transform. Since we've already seperated each edge with connected components, the hough transform is solely to determine the slope and mean of the line in Hough space.
+
+1) Select a large edge
+2) Create a seperate pixset for that edge
+3) Run the hough transform
+3) Run an intersect function on hough transform and pixset
+4) Get the line segment coordinates
+5) 
+4) Filter the line using raster to find max and min y coordinates (get li)
+
+```{r}
+cl <- makeCluster(3)
+registerDoParallel(cl)
+
+plot <- FALSE
+line_segments_df <- data.frame()
+large_edge_values <- large_edge_df %>% pull(value) %>% unique()
+# select an edge
+line_segments_df <- foreach (val = large_edge_values,
+         .packages = c('imager','tidyverse','raster'),
+         .export = c('large_edge_df','plot'),
+         .combine = rbind) %dopar% {
+  edge <- large_edge_df %>% filter(value == val)
+  
+  # reset index to zero for each edge
+  min_x <- min(edge$x)
+  min_y <- min(edge$y)
+  edge$x <- edge$x - min_x + 1
+  edge$y <- edge$y - min_y + 1
+  edge_img <- as.pixset(as.cimg(edge))
+  
+  # calculate Hough transform, save top 100 for plotting and most votes for analysis
+  hough_df <- hough_line(edge_img,ntheta = 500, data.frame = TRUE, shift = TRUE) %>% top_n(100,score)
+  hough_top <- hough_df %>% top_n(1,score) %>% dplyr::select(theta, rho)
+  
+  # get line segment
+  ## calculate slope and intercept of best Hough line
+  if (hough_top[1,'theta'] >= 1E-4){
+    h_slope = cos(hough_top[1,'theta'])/sin(hough_top[1,'theta'])
+    h_intercept = -hough_top[1,'rho']/sin(hough_top[1,'theta'])
+  }
+  
+  ## generate the raster
+  rast <- raster(x = as.matrix(edge_img) %>% t(), xmn = 1, ymn = -dim(edge_img)[2], 
+                 xmx = dim(edge_img)[1], ymx = -1) 
+  rast[rast < 0.99] <- NA
+  
+  ## project the line and extract from the raster
+  x <- seq(extent(rast)[1], extent(rast)[2], by = 0.1)
+  if (hough_top[1,'theta'] >= 1E-4){  
+    y <- round(x * h_slope + h_intercept,0.1) * -1
+  } else {
+    y <- seq(-extent(rast)[4], -extent(rast)[3], length.out = length(x))
+  }
+  
+  rast_int <- raster::extract(rast,cbind(x,-y)) %>% as.logical
+  rast_int[is.na(rast_int)] <- FALSE
+  
+  ## extract the segment
+  y0 <- min(y[rast_int])
+  y1 <- max(y[rast_int])
+  
+  # if (hough_top[1,'theta'] >= 1E-4){  
+  #   x0 <- ((y0 - h_intercept)/h_slope - 1) * -1
+  #   x1 <- ((y1 - h_intercept)/h_slope - 1) * -1
+  # } else {
+  #   x0 <- x1 <- mean(x[rast_int])
+  # }
+  
+  ## try a simpler transform here to match coordinates
+  x0 <- min(x[rast_int][y[rast_int] == y0])
+  x1 <- min(x[rast_int][y[rast_int] == y1])
+  line <- data.frame(x = c(x0,x1), y = c(y0,y1))
+  line_df <- data.frame(val, x0 + min_x, y0 + min_y, x1 + min_x, y1 + min_y)
+  
+  # create ggplot
+  if (plot) {
+    plt <- ggplot(as.data.frame(edge_img)) +
+    geom_raster(aes(x=x, y=-y)) +
+    coord_equal() +
+    xlab('Width (mm)') +
+    ylab('Height (mm)') +
+    theme_minimal()
+    
+    # draw a vertical line if theta is zero
+    hough_zero <- hough_df %>% filter(theta <= 1E-4)
+    if (nrow(hough_zero) != 0){
+      for (j in 1:nrow(hough_zero)){
+        plt <- plt + 
+          geom_vline(xintercept = hough_zero[j,'rho'], colour = 'red', alpha = 0.1)
+      }
+    }
+    
+    # draw a sloped line if theta != zero
+    for (j in 1:nrow(hough_df %>% filter(theta > 1E-4))){
+      plt <- plt +
+        geom_abline(slope = cos(hough_df[j,'theta'])/sin(hough_df[j,'theta']),
+                    intercept = -hough_df[j,'rho']/sin(hough_df[j,'theta']),
+                    colour = 'red', alpha = 0.1)
+    }
+    
+    if (hough_top[1,'theta'] >= 1E-4){
+      h_slope = cos(hough_top[1,'theta'])/sin(hough_top[1,'theta'])
+      h_intercept = -hough_top[1,'rho']/sin(hough_top[1,'theta'])
+      
+      # plot top scored line
+      plt <- plt + 
+        geom_abline(slope = h_slope, intercept = h_intercept, col = 'red', size = 1) +
+        geom_point(data = line, aes(x=x, y=-y), size = 2, colour = 'blue') +
+        ggsave(paste0('./edge_images/edge_',val,'.jpg'))
+    } else {
+      # plot vertical line
+      plt <- plt + 
+        geom_vline(xintercept = hough_top[1,'rho'], colour = 'red', size = 1) +
+        geom_point(data = line, aes(x=x, y=-y), colour = 'blue', size = 2 ) +
+        ggsave(paste0('./edge_images/edge_',val,'.jpg'))
+    }
+  }
+  
+  line_df
+}
+
+stopCluster(cl)
+
+write.csv(line_segments_df,paste0(out_path,'AC1_',window,'_',set,'_line_segments.csv'))
+```
+
+Convert segments to sf and write for further analysis.
+Make ggplot of fractures.
+```{r}
+colnames(line_segments_df) <- c('val','x0','y0','x1','y1')
+# # plot line segments and image
+# ggplot(as.data.frame(img_denoise)) + 
+#   geom_raster(aes(x=x, y=y, fill = value)) +
+#   geom_segment(data = line_segments_df, aes(x = x0, y = y0, xend = x1, yend = y1), 
+#                size = 1, colour = 'red') +
+#   coord_equal() +
+#   scale_y_reverse() +
+#   scale_fill_gradient(low="black",high="white") +
+#   ggsave()
+
+# convert to spatial lines
+begin <- cbind(line_segments_df$x0, -line_segments_df$y0)
+end <- cbind(line_segments_df$x1, -line_segments_df$y1)
+
+## raw list to store Lines objects
+l <- vector("list", nrow(begin))
+for (i in seq_along(l)) {
+    l[[i]] <- Lines(list(Line(rbind(begin[i, ], end[i,]))), as.character(i))
+}
+edges_sf <- st_as_sf(SpatialLines(l))
+
+st_write(edges_sf,paste0(out_path,'AC1_',window,'_',set,'_edges.dxf'), driver = 'DXF',delete_dsn = TRUE)
+
+print(paste(window,set,'done'))
+
+```

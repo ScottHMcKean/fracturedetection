@@ -1,0 +1,102 @@
+---
+title: "dxf_reader"
+author: "Scott McKean"
+date: "4/23/2019"
+output: html_document
+---
+
+Read in a .dxf file from acrobat using rGDAL
+
+```{r setup, include=FALSE}
+library(rgdal)
+library(raster)
+library(sp)
+library(sf)
+library(rgeos)
+library(tidyverse)
+```
+
+# Read file
+
+- We can export illustrator layers using .dxf files, which can be read by rgdal quite easily.
+
+```{r}
+# Read DXF file with rgdal
+shapefiles <- list.files(pattern = 'AC.*\\.dxf$', recursive = TRUE)
+scanline_df = data.frame()
+fracture_df = data.frame()
+window_df = data.frame()
+
+for (file in shapefiles){
+  # get window info
+  window <- str_extract(file,"AC1_.*/")
+  w_outcrop <- str_sub(window,1,3)
+  w_meas <- str_sub(window,5,6)
+  
+  ogr <- readOGR(dsn = file)
+  
+  sf_df <- st_as_sf(ogr)
+  
+  if (str_detect(file,'horiz')) {
+    # vertical line
+    x = seq(10,1000, by = 10)
+    coord <- x
+    set = 'horiz'
+    f_linestring <- function(x){
+      st_linestring(matrix(c(x,x,0,-1000), ncol = 2), dim = 'XY')
+    }
+  } else {
+    # horizontal line
+    x = seq(10,1000, by = 10)
+    coord <- x
+    set = 'vert'
+    f_linestring <- function(x){
+      st_linestring(matrix(c(0,1000,-x,-x), ncol = 2), dim = 'XY')
+    }
+  }
+  
+  # create linestrings for intersection
+  linestrings <- lapply(x,f_linestring) %>% st_sfc() %>% st_sf()
+  
+  # get line intersections
+  intersects <- st_intersects(linestrings, sf_df)
+  
+  # get summary statistics
+  frac_intensity <- sapply(intersects,length)
+  frac_spacing <- lapply(intersects,diff) %>% sapply(.,mean)
+  frac_length <- st_length(sf_df) %>% sum()
+  frac_number <- nrow(sf_df)
+  
+  # get angles
+  coords <- st_cast(sf_df, to = 'MULTIPOINT') %>% st_coordinates()
+  ind <- seq(1,nrow(coords), by = 2)
+  angles <- atan2((coords[ind+1,2]-coords[ind,2]),(coords[ind+1,1]-coords[ind,1]))
+  
+  # get centres
+  centroid <- st_centroid(sf_df) %>% st_coordinates()
+  
+  scanline_df <- data.frame('outcrop' = w_outcrop, 'window' = w_meas, 'set' = set,
+                            'coord' = coord, 'P10' = frac_intensity, 'spacing' = frac_spacing) %>%
+    rbind(scanline_df,.)
+  
+  fracture_df <- data.frame('outcrop' = w_outcrop, 'window' = w_meas, 'set' = set, 
+                            'length' = st_length(sf_df), 'angle' = angles, 
+                            'x_centre' = centroid[,1], 'y_centre' = -centroid[,2])  %>%
+    rbind(fracture_df,.)
+  
+  window_df <- data.frame('outcrop' = w_outcrop, 'window' = w_meas, 'set' = set, 
+                          'P21' = frac_length, 'P20' = nrow(sf_df)) %>%
+    rbind(window_df,.)
+}
+
+```
+
+```{r}
+# show log normal distribution of fracture lengths
+ggplot(fracture_df) +
+  geom_histogram(aes(x=log10(length)), bins = 100)
+
+# show bimodal distribution of fracture sets + random sets
+ggplot(fracture_df) +
+  geom_histogram(aes(x=angle*180/pi), bins = 100)
+```
