@@ -16,14 +16,6 @@ library(sf)
 library(parallel)
 library(doParallel)
 library(foreach)
-
-expandStrong <- function(ws) {
-  overlap <- grow(ws$strong,2) & ws$weak
-  ws$strong[overlap] <- TRUE
-  ws$weak[overlap] <- FALSE
-  ws
-}
-
 ```
 
 # Fracture identification in R

@@ -8,12 +8,41 @@ output: html_document
 Read in a .dxf file from acrobat using rGDAL
 
 ```{r setup, include=FALSE}
-library(rgdal)
-library(raster)
-library(sp)
-library(sf)
-library(rgeos)
-library(tidyverse)
+dxf_file <- 'munge/vertedges.dxf'
+
+read_process_dxf <- function(dxf_file, scanline_direction = 'horiz'){
+  sf_df <- readOGR(dsn = dxf_file) %>%
+    st_as_sf(ogr)
+  
+  if (!scanline_direction %in% c('horiz','vert')){
+    warning('Scanline direction not specified as horizontal or vertical, setting to horizontal')
+    scanline_direction = 'horiz'
+  }
+  
+  
+}
+  
+  if (str_detect(file,'horiz')) {
+    # vertical line
+    x = seq(10,1000, by = 10)
+    coord <- x
+    set = 'horiz'
+    col <- 'Y'
+    f_linestring <- function(x){
+      st_linestring(matrix(c(x,x,0,-1000), ncol = 2), dim = 'XY')
+    }
+    linestrings <- lapply(x,f_linestring) %>% st_sfc() %>% st_sf()
+  } else {
+    # horizontal line
+    y = seq(10,1000, by = 10)
+    coord <- y
+    set = 'vert'
+    col <- 'X'
+    f_linestring <- function(y){
+      st_linestring(matrix(c(0,1000,-y,-y), ncol = 2), dim = 'XY')
+    }
+    linestrings <- lapply(y,f_linestring) %>% st_sfc() %>% st_sf()
+  }
 ```
 
 # Read file

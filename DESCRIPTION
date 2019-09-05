@@ -1,11 +1,23 @@
 Package: fracturedetection
 Type: Package
-Title: What the Package Does (Title Case)
-Version: 0.1.0
+Title: Detect and Analyze Fractures in Outcrop Photos
+Version: 0.5.0
 Author: Who wrote it
 Maintainer: The package maintainer <yourself@somewhere.net>
-Description: More about what it does (maybe more than one line)
-    Use four spaces when indenting paragraphs within the Description.
-License: What license is it under?
+Description: This package runs image segmentation on grayscale photographs of 
+    outcrops, windows, and hand samples and returns .dxf files of the resulting
+    edges along with statistics for structural geology analysis. Makes use of
+    the Canny Edge Detector, the Hough Transform, Connected Component Analysis,
+    and numerous features from the sp/sf libraries
+License: GNU GPL V3
+Depends:
+    imager,
+    raster,
+    rgdal,
+    rgeos,
+    sp,
+    sf,
+    tidyverse
+Suggests:
 Encoding: UTF-8
 LazyData: true
